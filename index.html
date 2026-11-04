@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover нужен, чтобы env(safe-area-inset-*) работал на телефонах с вырезом -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0c0a12">
+<title>Пиксельный рогалик</title>
+<style>
+  /* ---------- Базовая раскладка: холст на весь экран ---------- */
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #0c0a12; color: #e6e6e6;
+    font-family: "DejaVu Sans Mono", Consolas, monospace;
+    touch-action: none;            /* браузер не скроллит и не зумит по жестам */
+    user-select: none; -webkit-user-select: none;
+    overscroll-behavior: none;
+  }
+  #game {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0; width: 100%; height: 100%;
+    display: block;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+  }
+
+  /* ---------- HUD сверху, с отступом под вырез/статус-бар ---------- */
+  #hud {
+    position: fixed; left: 0; right: 0; top: 0;
+    padding: calc(env(safe-area-inset-top) + 6px)
+             calc(env(safe-area-inset-right) + 10px) 6px
+             calc(env(safe-area-inset-left) + 10px);
+    background: linear-gradient(rgba(20,18,28,.92), rgba(20,18,28,.75));
+    font-size: clamp(11px, 3.2vw, 15px); line-height: 1.35;
+    pointer-events: none;
+  }
+  #stats { font-weight: bold; }
+  #log { color: #aaaabe; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* ---------- Размер элементов управления зависит от экрана ---------- */
+  :root {
+    --joy: clamp(110px, 32vmin, 170px);   /* диаметр базы джойстика */
+    --btn: clamp(48px, 14vmin, 72px);     /* диаметр кнопки действия */
+    --pad-b: calc(env(safe-area-inset-bottom) + 16px);
+    --pad-l: calc(env(safe-area-inset-left) + 16px);
+    --pad-r: calc(env(safe-area-inset-right) + 16px);
+  }
+
+  /* ---------- Виртуальный джойстик (левый нижний угол) ---------- */
+  #joyZone {
+    /* Зона касания больше самой базы, чтобы удобно попадать пальцем */
+    position: fixed; left: 0; bottom: 0; width: 50%; height: 55%;
+  }
+  #joyBase {
+    position: absolute;
+    left: var(--pad-l); bottom: var(--pad-b);
+    width: var(--joy); height: var(--joy); border-radius: 50%;
+    background: rgba(255,255,255,.08);
+    border: 2px solid rgba(255,255,255,.25);
+  }
+  #joyStick {
+    position: absolute; left: 50%; top: 50%;
+    width: 42%; height: 42%; margin: -21% 0 0 -21%;
+    border-radius: 50%;
+    background: rgba(90,200,255,.55);
+    border: 2px solid rgba(200,240,255,.8);
+    transition: transform .08s;
+  }
+  #joyZone.active #joyStick { transition: none; }
+
+  /* ---------- Кнопки действий (правый нижний угол) ---------- */
+  #buttons {
+    position: fixed; right: var(--pad-r); bottom: var(--pad-b);
+    display: grid; gap: 12px;
+    grid-template-columns: var(--btn) var(--btn);
+    grid-template-areas: ". r" "s f";
+  }
+  .btn {
+    width: var(--btn); height: var(--btn); border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.3);
+    background: rgba(255,255,255,.1); color: #fff;
+    font: bold calc(var(--btn) * .26) inherit;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    line-height: 1.05;
+  }
+  .btn small { font-size: .55em; font-weight: normal; opacity: .8; }
+  .btn.pressed { background: rgba(90,200,255,.45); }
+  #btnF { grid-area: f; border-color: rgba(250,205,60,.7); }
+  #btnS { grid-area: s; }
+  #btnR { grid-area: r; border-color: rgba(230,70,90,.6); }
+
+  /* ---------- Слой ошибок (виден без консоли) ---------- */
+  #errors {
+    position: fixed; left: 0; right: 0; top: 0; z-index: 1000;
+    padding: calc(env(safe-area-inset-top) + 50px) 10px 8px;
+    color: #ff4d4d; font: bold 13px monospace; white-space: pre-wrap;
+    word-break: break-word; pointer-events: none; display: none;
+    text-shadow: 0 0 3px #000, 0 0 3px #000;
+  }
+
+  /* В альбомной ориентации на низких экранах чуть ужимаем HUD */
+  @media (orientation: landscape) and (max-height: 500px) {
+    #hud { font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="errors"></div>
+
+<div id="hud">
+  <div id="stats"></div>
+  <div id="log"></div>
+</div>
+
+<div id="joyZone"><div id="joyBase"><div id="joyStick"></div></div></div>
+
+<div id="buttons">
+  <div class="btn" id="btnR">R<small>новый</small></div>
+  <div class="btn" id="btnS">␣<small>ждать</small></div>
+  <div class="btn" id="btnF">F<small>взять</small></div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Перехват ошибок: текст выводится красным поверх игры (на iPhone нет консоли)
+// ---------------------------------------------------------------------------
+function showError(msg) {
+  var el = document.getElementById("errors");
+  if (!el) { alert(msg); return; }
+  el.style.display = "block";
+  el.textContent += msg + "\n";
+}
+window.onerror = function (msg, src, line, col, err) {
+  showError("Ошибка: " + msg + " (строка " + line + ":" + col + ")" +
+            (err && err.stack ? "\n" + err.stack : ""));
+  return false;
+};
+window.addEventListener("unhandledrejection", function (e) {
+  showError("Promise: " + (e.reason && e.reason.message || e.reason));
+});
+</script>
+<script>
+"use strict";
+/*
+ * Пиксельный рогалик, HTML5-версия.
+ * Рендер строго ортогональный: вид прямо сверху, всё рисуется плоскими
+ * квадратными тайлами по сетке, без перспективы и изометрии.
+ *
+ * Управление:
+ *   Джойстик / стрелки / WASD — шаг на соседнюю клетку (шаг в монстра = удар)
+ *   F      — подобрать предмет под собой
+ *   Пробел — пропустить ход
+ *   R      — новый данж
+ */
+
+// ---------------------------------------------------------------------------
+// Настройки
+// ---------------------------------------------------------------------------
+const MAP_W = 80, MAP_H = 50;        // размер карты в клетках
+const MAX_ROOMS = 14;
+const ROOM_MIN = 5, ROOM_MAX = 11;
+const MONSTERS_PER_ROOM = 2;
+const WALL = 0, FLOOR = 1;
+const STEP_REPEAT_MS = 170;          // как часто делается шаг, пока стик отклонён
+
+// Палитра
+const C = {
+  bg: "#0c0a12", wall: "#463e54", wallDark: "#302a3c",
+  floor: "#24202c", floorDot: "#2c2836",
+  hero: "#5ac8ff", slime: "#6ed25a", potion: "#e6465a", gold: "#facd3c",
+};
+
+// ---------------------------------------------------------------------------
+// Пиксельные спрайты 8x8 (вид сверху). Символ = цвет, '.' = прозрачно.
+// ---------------------------------------------------------------------------
+const SPRITES = {
+  hero:   ["........","..HHHH..",".HhHHhH.",".HHHHHHs",".HHHHHHs",".HhHHhH.","..HHHH..","........"],
+  slime:  ["........","..SSSS..",".SSSSSS.",".SeSSeS.",".SSSSSS.",".SSSSSS.","..SSSS..","........"],
+  potion: ["........","...cc...","...PP...","..PPPP..",".PPwPPP.",".PPPPPP.","..PPPP..","........"],
+  gold:   ["........","........","..GGGG..",".GGyGGG.",".GGGGGG.","..GGGG..","........","........"],
+};
+const SPRITE_COLORS = {
+  H: C.hero, h: "#142846", s: "#dcdce6",
+  S: C.slime, e: "#141e14",
+  P: C.potion, c: "#966e46", w: "#ffc8d2",
+  G: C.gold, y: "#fffac8",
+};
+
+// Каждый спрайт рендерим один раз в маленький холст 8x8,
+// потом растягиваем без сглаживания — получаются чёткие пиксели.
+function makeSprite(rows) {
+  const cv = document.createElement("canvas");
+  cv.width = cv.height = 8;
+  const g = cv.getContext("2d");
+  rows.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (SPRITE_COLORS[ch]) { g.fillStyle = SPRITE_COLORS[ch]; g.fillRect(x, y, 1, 1); }
+  }));
+  return cv;
+}
+function makeFloorTile() {
+  const cv = document.createElement("canvas"); cv.width = cv.height = 8;
+  const g = cv.getContext("2d");
+  g.fillStyle = C.floor; g.fillRect(0, 0, 8, 8);
+  g.fillStyle = C.floorDot; g.fillRect(2, 2, 1, 1); g.fillRect(5, 6, 1, 1);
+  return cv;
+}
+function makeWallTile() {
+  // Плоская кирпичная кладка, вид сверху (16x16 для более тонких швов)
+  const cv = document.createElement("canvas"); cv.width = cv.height = 16;
+  const g = cv.getContext("2d");
+  g.fillStyle = C.wall; g.fillRect(0, 0, 16, 16);
+  g.fillStyle = C.wallDark;
+  g.fillRect(0, 0, 16, 1); g.fillRect(0, 8, 16, 1);
+  g.fillRect(8, 0, 1, 8);  g.fillRect(4, 8, 1, 8);
+  return cv;
+}
+const SPR = Object.fromEntries(Object.entries(SPRITES).map(([k, v]) => [k, makeSprite(v)]));
+const FLOOR_TILE = makeFloorTile();
+const WALL_TILE = makeWallTile();
+
+// ---------------------------------------------------------------------------
+// Утилиты случайности (аналоги random.randint / random.choice)
+// ---------------------------------------------------------------------------
+const randint = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const choice = arr => arr[Math.floor(Math.random() * arr.length)];
+
+// ---------------------------------------------------------------------------
+// Генерация данжа: случайные комнаты + коридоры буквой «Г»
+// ---------------------------------------------------------------------------
+class Room {
+  constructor(x, y, w, h) { this.x1 = x; this.y1 = y; this.x2 = x + w; this.y2 = y + h; }
+  center() { return [Math.floor((this.x1 + this.x2) / 2), Math.floor((this.y1 + this.y2) / 2)]; }
+  intersects(o) { // +1, чтобы между комнатами оставалась стена
+    return this.x1 <= o.x2 + 1 && this.x2 + 1 >= o.x1 && this.y1 <= o.y2 + 1 && this.y2 + 1 >= o.y1;
+  }
+  randomCell() { return [randint(this.x1 + 1, this.x2 - 1), randint(this.y1 + 1, this.y2 - 1)]; }
+}
+
+function generateDungeon() {
+  const tiles = Array.from({ length: MAP_H }, () => new Array(MAP_W).fill(WALL));
+  const rooms = [];
+  const carve = r => { for (let y = r.y1 + 1; y < r.y2; y++) for (let x = r.x1 + 1; x < r.x2; x++) tiles[y][x] = FLOOR; };
+  const hTunnel = (x1, x2, y) => { for (let x = Math.min(x1, x2); x <= Math.max(x1, x2); x++) tiles[y][x] = FLOOR; };
+  const vTunnel = (y1, y2, x) => { for (let y = Math.min(y1, y2); y <= Math.max(y1, y2); y++) tiles[y][x] = FLOOR; };
+
+  for (let i = 0; i < MAX_ROOMS * 5 && rooms.length < MAX_ROOMS; i++) {
+    const w = randint(ROOM_MIN, ROOM_MAX), h = randint(ROOM_MIN, ROOM_MAX);
+    const room = new Room(randint(0, MAP_W - w - 1), randint(0, MAP_H - h - 1), w, h);
+    if (rooms.some(o => room.intersects(o))) continue;
+    carve(room);
+    if (rooms.length) {
+      // Соединяем с предыдущей комнатой коридором «Г»
+      const [px, py] = rooms[rooms.length - 1].center(), [cx, cy] = room.center();
+      if (Math.random() < 0.5) { hTunnel(px, cx, py); vTunnel(py, cy, cx); }
+      else { vTunnel(py, cy, px); hTunnel(px, cx, cy); }
+    }
+    rooms.push(room);
+  }
+  return { tiles, rooms };
+}
+
+// ---------------------------------------------------------------------------
+// Сущности
+// ---------------------------------------------------------------------------
+class Entity {
+  constructor(x, y, sprite, name, hp, atk) {
+    Object.assign(this, { x, y, sprite, name, hp, maxHp: hp, atk });
+  }
+  get alive() { return this.hp > 0; }
+}
+class Item {
+  constructor(x, y, kind) { Object.assign(this, { x, y, kind, sprite: SPR[kind] }); }
+}
+
+// ---------------------------------------------------------------------------
+// Камера: держит игрока в центре, не выходит за края карты, едет плавно
+// ---------------------------------------------------------------------------
+class Camera {
+  constructor() { this.x = 0; this.y = 0; }
+  target(p, tile, vw, vh) {
+    let tx = p.x * tile + tile / 2 - vw / 2;
+    let ty = p.y * tile + tile / 2 - vh / 2;
+    // Если карта меньше экрана — центрируем, иначе зажимаем у краёв
+    tx = MAP_W * tile <= vw ? (MAP_W * tile - vw) / 2 : Math.max(0, Math.min(tx, MAP_W * tile - vw));
+    ty = MAP_H * tile <= vh ? (MAP_H * tile - vh) / 2 : Math.max(0, Math.min(ty, MAP_H * tile - vh));
+    return [tx, ty];
+  }
+  update(p, dt, tile, vw, vh) {
+    const [tx, ty] = this.target(p, tile, vw, vh);
+    const k = Math.min(1, dt * 12);
+    this.x += (tx - this.x) * k; this.y += (ty - this.y) * k;
+  }
+  snap(p, tile, vw, vh) { [this.x, this.y] = this.target(p, tile, vw, vh); }
+}
+
+// ---------------------------------------------------------------------------
+// Игра
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+if (!ctx) throw new Error("canvas.getContext('2d') вернул null — браузер не дал 2D-контекст");
+const statsEl = document.getElementById("stats");
+const logEl = document.getElementById("log");
+
+let view = { w: 0, h: 0, tile: 32, dpr: 1 };
+
+const game = {
+  newLevel() {
+    const { tiles, rooms } = generateDungeon();
+    if (!rooms.length) throw new Error("generateDungeon: не создано ни одной комнаты");
+    this.tiles = tiles; this.rooms = rooms;
+    const [px, py] = rooms[0].center();
+    this.player = new Entity(px, py, SPR.hero, "Герой", 30, 5);
+    this.gold = 0; this.potions = 0;
+    this.monsters = []; this.items = [];
+    this.log = ["Добро пожаловать в данж!"];
+    // Случайный спавн слизней во всех комнатах, кроме стартовой
+    for (const room of rooms.slice(1)) {
+      for (let i = randint(0, MONSTERS_PER_ROOM); i > 0; i--) {
+        const [x, y] = room.randomCell();
+        if (!this.monsterAt(x, y))
+          this.monsters.push(new Entity(x, y, SPR.slime, "Слизень", randint(8, 12), randint(2, 4)));
+      }
+    }
+    this.camera = new Camera();
+    this.camera.snap(this.player, view.tile, view.w, view.h);
+    updateHud();
+  },
+
+  isFloor(x, y) { return x >= 0 && x < MAP_W && y >= 0 && y < MAP_H && this.tiles[y][x] === FLOOR; },
+  monsterAt(x, y) { return this.monsters.find(m => m.alive && m.x === x && m.y === y) || null; },
+  message(t) { this.log.push(t); this.log = this.log.slice(-3); },
+
+  // --- бой ---
+  attack(a, t) {
+    const dmg = randint(Math.max(1, a.atk - 1), a.atk + 1);
+    t.hp -= dmg;
+    this.message(`${a.name} атакует, ${t.name} теряет ${dmg} HP`);
+    if (!t.alive) {
+      if (t === this.player) this.message("Вы погибли... Нажмите R для новой игры.");
+      else { this.message(`${t.name} повержен!`); this.dropLoot(t); }
+    }
+  },
+  dropLoot(m) { // 40% золото, 20% зелье, 40% ничего
+    const r = Math.random();
+    if (r < 0.4) this.items.push(new Item(m.x, m.y, "gold"));
+    else if (r < 0.6) this.items.push(new Item(m.x, m.y, "potion"));
+  },
+
+  // --- действия игрока (возвращают true, если ход потрачен) ---
+  tryMove(dx, dy) {
+    const nx = this.player.x + dx, ny = this.player.y + dy;
+    const t = this.monsterAt(nx, ny);
+    if (t) this.attack(this.player, t);              // удар по соседней клетке
+    else if (this.isFloor(nx, ny)) { this.player.x = nx; this.player.y = ny; }
+    else return false;                               // в стену — ход не тратится
+    return true;
+  },
+  pickUp() {
+    const i = this.items.findIndex(it => it.x === this.player.x && it.y === this.player.y);
+    if (i < 0) { this.message("Здесь нечего подбирать."); return false; }
+    const item = this.items.splice(i, 1)[0];
+    if (item.kind === "gold") {
+      const amount = randint(5, 20); this.gold += amount;
+      this.message(`Подобрано золото: +${amount}`);
+    } else {
+      const heal = 10;
+      this.player.hp = Math.min(this.player.maxHp, this.player.hp + heal);
+      this.potions++;
+      this.message(`Выпито зелье: +${heal} HP`);
+    }
+    return true;
+  },
+
+  // --- ход монстров: ИИ слизней ---
+  monstersTurn() {
+    const p = this.player;
+    const canStep = (nx, ny) => this.isFloor(nx, ny) && !this.monsterAt(nx, ny) && !(nx === p.x && ny === p.y);
+    for (const m of this.monsters) {
+      if (!m.alive || !p.alive) continue;
+      const dx = p.x - m.x, dy = p.y - m.y, dist = Math.abs(dx) + Math.abs(dy);
+      if (dist === 1) this.attack(m, p);           // рядом — бьём
+      else if (dist <= 8) {                         // видим — преследуем
+        let steps = [];
+        if (dx) steps.push([Math.sign(dx), 0]);
+        if (dy) steps.push([0, Math.sign(dy)]);
+        if (Math.abs(dy) > Math.abs(dx)) steps.reverse();
+        for (const [sx, sy] of steps) {
+          if (canStep(m.x + sx, m.y + sy)) { m.x += sx; m.y += sy; break; }
+        }
+      } else {                                      // далеко — бродим
+        const [sx, sy] = choice([[1,0],[-1,0],[0,1],[0,-1],[0,0]]);
+        if (canStep(m.x + sx, m.y + sy)) { m.x += sx; m.y += sy; }
+      }
+    }
+    this.monsters = this.monsters.filter(m => m.alive);
+  },
+
+  // --- единая точка входа для всех команд (клавиатура, джойстик, кнопки) ---
+  act(cmd) {
+    if (cmd === "new") { this.newLevel(); return; }
+    if (!this.player.alive) return;
+    let took = false;
+    if (Array.isArray(cmd)) took = this.tryMove(cmd[0], cmd[1]);
+    else if (cmd === "wait") took = true;
+    else if (cmd === "pick") took = this.pickUp();
+    if (took) this.monstersTurn();               // пошаговость: после игрока ходят монстры
+    updateHud();
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Адаптивный размер холста и тайла
+// ---------------------------------------------------------------------------
+function resize() {
+  view.dpr = window.devicePixelRatio || 1;
+  // На iOS при загрузке innerWidth/innerHeight иногда кратко равны 0,
+  // поэтому берём максимум из нескольких источников размера.
+  const vv = window.visualViewport;
+  view.w = Math.round(Math.max(canvas.clientWidth, window.innerWidth, vv ? vv.width : 0, document.documentElement.clientWidth)) || 1;
+  view.h = Math.round(Math.max(canvas.clientHeight, window.innerHeight, vv ? vv.height : 0, document.documentElement.clientHeight)) || 1;
+  canvas.width = Math.round(view.w * view.dpr);
+  canvas.height = Math.round(view.h * view.dpr);
+  // Около 11 клеток по короткой стороне экрана, кратно 8 для ровных пикселей
+  const t = Math.floor(Math.min(view.w, view.h) / 11 / 8) * 8;
+  view.tile = Math.max(24, Math.min(64, t || 24));
+  if (game.player) game.camera.snap(game.player, view.tile, view.w, view.h);
+}
+window.addEventListener("resize", resize);
+if (window.visualViewport) window.visualViewport.addEventListener("resize", resize);
+window.addEventListener("load", resize);
+window.addEventListener("pageshow", resize);
+window.addEventListener("orientationchange", () => setTimeout(resize, 200));
+
+// ---------------------------------------------------------------------------
+// Отрисовка: строго ортогональная сетка, слои пол/стены, предметы, монстры, герой
+// ---------------------------------------------------------------------------
+function draw() {
+  const T = view.tile, cam = game.camera;
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, view.w, view.h);
+
+  // Округляем смещение камеры до физического пикселя — без «мыла» на швах
+  const ox = Math.round(cam.x * view.dpr) / view.dpr, oy = Math.round(cam.y * view.dpr) / view.dpr;
+  const x0 = Math.max(0, Math.floor(ox / T)), y0 = Math.max(0, Math.floor(oy / T));
+  const x1 = Math.min(MAP_W, x0 + Math.ceil(view.w / T) + 2);
+  const y1 = Math.min(MAP_H, y0 + Math.ceil(view.h / T) + 2);
+  const sx = gx => gx * T - ox, sy = gy => gy * T - oy;
+
+  for (let gy = y0; gy < y1; gy++)
+    for (let gx = x0; gx < x1; gx++)
+      ctx.drawImage(game.tiles[gy][gx] === FLOOR ? FLOOR_TILE : WALL_TILE, sx(gx), sy(gy), T, T);
+
+  for (const it of game.items) ctx.drawImage(it.sprite, sx(it.x), sy(it.y), T, T);
+  for (const m of game.monsters) {
+    ctx.drawImage(m.sprite, sx(m.x), sy(m.y), T, T);
+    // Полоска HP над монстром
+    const bh = Math.max(3, T / 10);
+    ctx.fillStyle = "#500000"; ctx.fillRect(sx(m.x), sy(m.y) - bh - 1, T, bh);
+    ctx.fillStyle = "#dc2828"; ctx.fillRect(sx(m.x), sy(m.y) - bh - 1, T * Math.max(0, m.hp) / m.maxHp, bh);
+  }
+  if (game.player.alive) ctx.drawImage(game.player.sprite, sx(game.player.x), sy(game.player.y), T, T);
+}
+
+function updateHud() {
+  const p = game.player;
+  statsEl.textContent = `HP ${Math.max(0, p.hp)}/${p.maxHp}  Золото ${game.gold}  Зелий ${game.potions}  Монстров ${game.monsters.length}`;
+  logEl.innerHTML = game.log.slice(-2).map(s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;")).join("<br>");
+}
+
+// ---------------------------------------------------------------------------
+// Клавиатура (для ПК)
+// ---------------------------------------------------------------------------
+const KEY_MOVES = {
+  ArrowUp: [0,-1], KeyW: [0,-1], ArrowDown: [0,1], KeyS: [0,1],
+  ArrowLeft: [-1,0], KeyA: [-1,0], ArrowRight: [1,0], KeyD: [1,0],
+};
+window.addEventListener("keydown", e => {
+  if (KEY_MOVES[e.code]) game.act(KEY_MOVES[e.code]);
+  else if (e.code === "KeyF") game.act("pick");
+  else if (e.code === "Space") game.act("wait");
+  else if (e.code === "KeyR") game.act("new");
+  else return;
+  e.preventDefault();
+});
+
+// ---------------------------------------------------------------------------
+// Виртуальный джойстик: палец тянет стик, направление округляется до 4 сторон.
+// Пока стик отклонён, герой шагает каждые STEP_REPEAT_MS.
+// ---------------------------------------------------------------------------
+const joyZone = document.getElementById("joyZone");
+const joyBase = document.getElementById("joyBase");
+const joyStick = document.getElementById("joyStick");
+const joy = { pointer: null, dir: null, nextStep: 0 };
+
+function joyMove(e) {
+  const r = joyBase.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2, maxR = r.width / 2;
+  let dx = e.clientX - cx, dy = e.clientY - cy;
+  const len = Math.hypot(dx, dy);
+  if (len > maxR) { dx *= maxR / len; dy *= maxR / len; }   // стик не вылезает за базу
+  joyStick.style.transform = `translate(${dx}px, ${dy}px)`;
+  // Мёртвая зона 30% радиуса, дальше — доминирующая ось
+  let dir = null;
+  if (len > maxR * 0.3) dir = Math.abs(dx) > Math.abs(dy) ? [Math.sign(dx), 0] : [0, Math.sign(dy)];
+  const changed = String(dir) !== String(joy.dir);
+  joy.dir = dir;
+  if (dir && changed) { game.act(dir); joy.nextStep = performance.now() + STEP_REPEAT_MS * 1.6; }
+}
+function joyEnd(e) {
+  if (e.pointerId !== joy.pointer) return;
+  joy.pointer = null; joy.dir = null;
+  joyZone.classList.remove("active");
+  joyStick.style.transform = "translate(0, 0)";
+}
+joyZone.addEventListener("pointerdown", e => {
+  if (joy.pointer !== null) return;
+  joy.pointer = e.pointerId;
+  joyZone.setPointerCapture(e.pointerId);
+  joyZone.classList.add("active");
+  joyMove(e);
+});
+joyZone.addEventListener("pointermove", e => { if (e.pointerId === joy.pointer) joyMove(e); });
+joyZone.addEventListener("pointerup", joyEnd);
+joyZone.addEventListener("pointercancel", joyEnd);
+
+// ---------------------------------------------------------------------------
+// Кнопки действий
+// ---------------------------------------------------------------------------
+function bindButton(id, cmd) {
+  const el = document.getElementById(id);
+  el.addEventListener("pointerdown", e => {
+    e.preventDefault(); el.classList.add("pressed");
+    if (navigator.vibrate) navigator.vibrate(10);   // лёгкая вибрация, где поддерживается
+    game.act(cmd);
+  });
+  const up = () => el.classList.remove("pressed");
+  el.addEventListener("pointerup", up); el.addEventListener("pointercancel", up); el.addEventListener("pointerleave", up);
+}
+bindButton("btnF", "pick");
+bindButton("btnS", "wait");
+bindButton("btnR", "new");
+
+// Запрет контекстного меню и двойного тапа-зума
+document.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault());
+
+// ---------------------------------------------------------------------------
+// Главный цикл
+// ---------------------------------------------------------------------------
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  // Если размер холста не совпадает с экраном (например, был 0 при загрузке) — пересчитываем
+  if (canvas.width !== Math.round(canvas.clientWidth * view.dpr) ||
+      canvas.height !== Math.round(canvas.clientHeight * view.dpr)) resize();
+  // Повтор шага при удержании джойстика
+  if (joy.dir && now >= joy.nextStep) { game.act(joy.dir); joy.nextStep = now + STEP_REPEAT_MS; }
+  game.camera.update(game.player, dt, view.tile, view.w, view.h);
+  try { draw(); }
+  catch (err) { showError("draw(): " + err.message + "\n" + (err.stack || "")); return; }
+  requestAnimationFrame(loop);
+}
+
+// Порядок старта: размеры экрана, затем уровень (камере нужен размер тайла), затем цикл
+try {
+  resize();
+  game.newLevel();
+  requestAnimationFrame(loop);
+} catch (err) {
+  showError("Старт: " + err.message + "\n" + (err.stack || ""));
+}
+</script>
+</body>
+</html>
